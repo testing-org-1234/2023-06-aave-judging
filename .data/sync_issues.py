@@ -1,9 +1,10 @@
 import datetime
 import os
+import re
 import time
 from functools import lru_cache, wraps
 
-from github import Github, Issue, Repository
+from github import ContentFile, Github, Issue, Repository
 from github.GithubException import (
     GithubException,
     RateLimitExceededException,
@@ -59,6 +60,26 @@ class RepositoryExtended(Repository.Repository):
         return repo
 
 
+class ContentFileExtended(ContentFile.ContentFile):
+    @classmethod
+    def cast(cls, content_file: ContentFile):
+        content_file.__class__ = ContentFileExtended
+
+        for func in ["_completeIfNotSet"]:
+            setattr(content_file, func, github_retry_on_rate_limit(getattr(content_file, func)))
+        return content_file
+
+class GithubExtended(Github):
+    @classmethod
+    def cast(cls, github: Github):
+        github.__class__ = GithubExtended
+
+        for func in ["get_repo"]:
+            setattr(github, func, github_retry_on_rate_limit(getattr(github, func)))
+        return github
+
+github = GithubExtended.cast(github)
+
 # Issues list. Each issue is in the format:
 # {
 #   "id": 1,  # corresponds to the issue 001
@@ -74,6 +95,7 @@ issues = {}
 
 
 def process_directory(repo, path):
+    print("Processing directory %s" % path)
     global issues
 
     repo_items = [
@@ -90,12 +112,27 @@ def process_directory(repo, path):
         dir_issues_ids = []
         severity = "false"
         if item.type == "dir":
-            closed = False
+            closed = any(x in item.name for x in ["low", "false", "invalid"])
             # If it's a directory, we have some duplicate issues
             files = list(repo.get_contents(item.path))
+            dirs = [x for x in files if x.type == 'dir']
+            files = [x for x in files if x.type != 'dir']
+            for dir in dirs:
+                process_directory(repo, dir.path)
             try:
                 if not closed:
-                    severity = item.name.split("-")[1]
+                    directory_severity = None
+                    try:
+                        directory_severity = re.match(r"^(H|M|High|Medium)-\d+$", item.name, re.IGNORECASE).group(1).upper()[0]
+                    except Exception:
+                        pass
+                    if not directory_severity:
+                        try:
+                            directory_severity = re.match(r"^\d+-(H|M|High|Medium)$", item.name, re.IGNORECASE).group(1).upper()[0]
+                        except Exception:
+                            pass
+                    if directory_severity:
+                        severity = directory_severity
             except Exception:
                 pass
         else:
@@ -103,15 +140,17 @@ def process_directory(repo, path):
             files = [item]
 
         for file in files:
+            file = ContentFileExtended.cast(file)
             if "best" in file.name:
                 issue_id = int(file.name.replace("-best.md", ""))
                 parent = issue_id
             else:
                 issue_id = int(file.name.replace(".md", ""))
-
+            
             body = file.decoded_content.decode("utf-8")
             auditor = body.split("\n")[0]
-            title = auditor + " - " + body.split("\n")[4].split("# ")[1]
+            issue_title = re.match(r"^(?:[#\s]+)(.*)$", body.split("\n")[4]).group(1)
+            title = f"{auditor} - {issue_title}"
 
             # Stop the script if an issue is found multiple times in the filesystem
             if issue_id in issues.keys():
@@ -130,12 +169,12 @@ def process_directory(repo, path):
             dir_issues_ids.append(issue_id)
 
         # Set the parent field for all duplicates in this directory
-        if len(files) > 1 and parent is None:
+        if len(files) > 1 and parent is None and severity != "false":
             raise Exception(
                 "Issue %s does not have a primary file (-best.md)." % item.path
             )
 
-        if parent:
+        if parent and not closed:
             for issue_id in dir_issues_ids:
                 if issue_id != parent:
                     issues[parent]["has_duplicates"] = True
@@ -157,24 +196,7 @@ def main():
     run_number = int(os.environ.get("GITHUB_RUN_NUMBER"))
 
     repo = RepositoryExtended.cast(github.get_repo(repo))
-
-    process_directory(repo, "")
-    # Sort them by ID so we match the order
-    # in which GitHub Issues created
-    issues = dict(sorted(issues.items(), key=lambda item: item[1]["id"]))
-
-    # Ensure issue IDs are sequential
-    actual_issue_ids = list(issues.keys())
-    expected_issue_ids = list(range(1, max(actual_issue_ids) + 1))
-    missing_issue_ids = [x for x in expected_issue_ids if x not in actual_issue_ids]
-    assert (
-        actual_issue_ids == expected_issue_ids
-    ), "Expected issues %s actual issues %s. Missing %s" % (
-        expected_issue_ids,
-        actual_issue_ids,
-        missing_issue_ids,
-    )
-
+    
     labels = [
         {
             "name": "High",
@@ -273,6 +295,23 @@ def main():
                 repo.create_label(**label)
     else:
         print("Skipping creating labels.")
+
+    process_directory(repo, "")
+    # Sort them by ID so we match the order
+    # in which GitHub Issues created
+    issues = dict(sorted(issues.items(), key=lambda item: item[1]["id"]))
+
+    # Ensure issue IDs are sequential
+    actual_issue_ids = list(issues.keys())
+    expected_issue_ids = list(range(1, max(actual_issue_ids) + 1))
+    missing_issue_ids = [x for x in expected_issue_ids if x not in actual_issue_ids]
+    assert (
+        actual_issue_ids == expected_issue_ids
+    ), "Expected issues %s actual issues %s. Missing %s" % (
+        expected_issue_ids,
+        actual_issue_ids,
+        missing_issue_ids,
+    )
 
     # Sync issues
     for issue_id, issue in issues.items():
